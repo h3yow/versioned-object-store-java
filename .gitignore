@@ -37,3 +37,6 @@ build/
 
 ### Mac OS ###
 .DS_Store
+### 本地对象存储运行数据与日志 ###
+/data/
+*.log
