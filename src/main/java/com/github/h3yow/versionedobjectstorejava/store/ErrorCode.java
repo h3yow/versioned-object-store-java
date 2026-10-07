@@ -19,5 +19,9 @@ public enum ErrorCode {
     /** 保留期内禁止删除/回收 */
     RETENTION_ACTIVE,
     /** 合规锁定内禁止删除/回收 */
-    COMPLIANCE_LOCKED
+    COMPLIANCE_LOCKED,
+    /** 批量提交请求本身不合法（空批次、批内重复对象键等） */
+    BATCH_INVALID,
+    /** 同一批量标识重试时，请求内容与首次提交不一致 */
+    BATCH_RETRY_CONFLICT
 }

@@ -14,8 +14,17 @@ import java.time.Instant;
  * @param committedBy   提交者
  * @param retentionUntil 保留截止时刻；{@code null} 表示无保留期
  * @param complianceLock 合规锁定；锁定期间禁止删除与回收
+ * @param batchId       所属批量提交标识；{@code null} 表示单对象写入
  */
 public record VersionInfo(String bucket, String key, long version, String sha256, long size,
                           Instant committedAt, String committedBy,
-                          Instant retentionUntil, boolean complianceLock) {
+                          Instant retentionUntil, boolean complianceLock, String batchId) {
+
+    /** 单对象写入版本的兼容构造器。 */
+    public VersionInfo(String bucket, String key, long version, String sha256, long size,
+                       Instant committedAt, String committedBy,
+                       Instant retentionUntil, boolean complianceLock) {
+        this(bucket, key, version, sha256, size, committedAt, committedBy,
+                retentionUntil, complianceLock, null);
+    }
 }
