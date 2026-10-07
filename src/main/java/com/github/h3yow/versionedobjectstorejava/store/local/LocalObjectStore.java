@@ -9,6 +9,9 @@ import com.github.h3yow.versionedobjectstorejava.store.ObjectStore;
 import com.github.h3yow.versionedobjectstorejava.store.StoreException;
 import com.github.h3yow.versionedobjectstorejava.store.acl.LocalAccessControl;
 import com.github.h3yow.versionedobjectstorejava.store.acl.Role;
+import com.github.h3yow.versionedobjectstorejava.store.model.BatchCommit;
+import com.github.h3yow.versionedobjectstorejava.store.model.BatchItem;
+import com.github.h3yow.versionedobjectstorejava.store.model.BatchResult;
 import com.github.h3yow.versionedobjectstorejava.store.model.RetentionPolicy;
 import com.github.h3yow.versionedobjectstorejava.store.model.VersionInfo;
 import com.github.h3yow.versionedobjectstorejava.store.model.WriteRequest;
@@ -28,14 +31,17 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Local-disk only implementation of {@link ObjectStore}.
@@ -64,6 +70,7 @@ public class LocalObjectStore implements ObjectStore {
 
     private final Path blobsDir;
     private final Path bucketsDir;
+    private final Path batchesDir;
     private final long quotaBytes;
     private final LocalAccessControl accessControl;
 
@@ -71,19 +78,33 @@ public class LocalObjectStore implements ObjectStore {
     private final Map<String, ReentrantLock> objectLocks = new ConcurrentHashMap<>();
     /** Global lock guarding blob creation and quota accounting. */
     private final Object blobLock = new Object();
+    /** Serializes batch commits so identical batchIds cannot race each other. */
+    private final ReentrantLock batchLock = new ReentrantLock();
+    /**
+     * Visibility lock: readers hold the read lock, a batch commit holds the write
+     * lock while flipping all HEADs, so the whole batch becomes visible in one
+     * atomic transition and no read observes a half-applied batch.
+     */
+    private final ReentrantReadWriteLock visibilityLock = new ReentrantReadWriteLock();
     private final AtomicLong usedBytes;
 
     /** Test hook: fired after version metadata is durable but before HEAD update. */
     private volatile Runnable commitHook = null;
+    /** Test hook: fired after the batch commit record is durable but before HEAD flips. */
+    private volatile Runnable batchCommitHook = null;
+    /** Test hook: fired after batch metadata is durable, before the commit record. */
+    private volatile Runnable batchPrepareHook = null;
 
     public LocalObjectStore(Path root, long quotaBytes, LocalAccessControl accessControl) {
         this.blobsDir = root.resolve("blobs");
         this.bucketsDir = root.resolve("buckets");
+        this.batchesDir = root.resolve("batches");
         this.quotaBytes = quotaBytes;
         this.accessControl = accessControl;
         try {
             Files.createDirectories(blobsDir);
             Files.createDirectories(bucketsDir);
+            Files.createDirectories(batchesDir);
         } catch (IOException e) {
             throw new UncheckedIOException("failed to initialize store root " + root, e);
         }
@@ -94,6 +115,16 @@ public class LocalObjectStore implements ObjectStore {
     /** Test only: inject a mid-commit crash hook. */
     public void setCommitHookForTesting(Runnable hook) {
         this.commitHook = hook;
+    }
+
+    /** Test only: inject a hook after the batch commit record is durable, before HEAD flips. */
+    public void setBatchCommitHookForTesting(Runnable hook) {
+        this.batchCommitHook = hook;
+    }
+
+    /** Test only: inject a hook after batch metadata is durable, before the commit record. */
+    public void setBatchPrepareHookForTesting(Runnable hook) {
+        this.batchPrepareHook = hook;
     }
 
     // ---------------------------------------------------------------- bucket
@@ -165,17 +196,257 @@ public class LocalObjectStore implements ObjectStore {
         }
     }
 
+    // ------------------------------------------------------------- batch
+
+    /**
+     * Batch commit protocol (batchLock -> per-object locks in sorted order ->
+     * blobLock -> visibility write lock):
+     *   0) idempotency: a durable commit record for batchId means the batch is
+     *      already committed; replay the stored result without new versions/quota.
+     *   1) validate everything (ACL, structure, checksum, expectedVersion,
+     *      retention guard) before writing a single byte;
+     *   2) under blobLock: net-new bytes only (dedup within batch and against
+     *      existing blobs); quota check rejects the whole batch before any write;
+     *   3) write new blobs, then all version metadata files (tmp+fsync+rename);
+     *   4) atomically write batches/<batchId>.json — THE commit point;
+     *   5) under the visibility write lock flip every object's HEAD.
+     * Crash before 4: nothing visible, dangling metadata cleaned on restart,
+     * unreferenced blobs reclaimed by GC. Crash after 4: recovery replays the
+     * HEAD flips from the commit record.
+     */
+    @Override
+    public BatchResult commitBatch(String bucket, BatchCommit batch, String principal) {
+        accessControl.require(bucket, principal, Role.WRITER);
+        requireBucket(bucket);
+        validateBatchStructure(batch);
+        String fingerprint = fingerprint(batch);
+
+        batchLock.lock();
+        try {
+            Path recordFile = batchesDir.resolve(encode(batch.batchId()) + ".json");
+            BatchCommitRecord existing = readBatchRecord(recordFile);
+            if (existing != null) {
+                if (!existing.fingerprint().equals(fingerprint)) {
+                    throw new StoreException(ErrorCode.BATCH_ID_REUSED,
+                            "batch id '" + batch.batchId() + "' was already used by a different commit");
+                }
+                return new BatchResult(batch.batchId(), existing.versions(), true);
+            }
+
+            // per-object locks in sorted key order: serialize with single puts
+            List<BatchItem> items = batch.items().stream()
+                    .sorted(Comparator.comparing(BatchItem::key)).toList();
+            List<ReentrantLock> locks = items.stream()
+                    .map(i -> objectLock(bucket, i.key())).distinct().toList();
+            locks.forEach(ReentrantLock::lock);
+            try {
+                List<VersionInfo> prepared = prepareBatch(bucket, items, principal);
+
+                // test hook: simulate crash with metadata durable but no commit record
+                Runnable prepareHook = batchPrepareHook;
+                if (prepareHook != null) {
+                    prepareHook.run();
+                }
+
+                // result order follows the caller's item order
+                Map<String, VersionInfo> byKey = new HashMap<>();
+                for (VersionInfo v : prepared) {
+                    byKey.put(v.key(), v);
+                }
+                List<VersionInfo> versions = batch.items().stream()
+                        .map(i -> byKey.get(i.key())).toList();
+                BatchCommitRecord record = new BatchCommitRecord(
+                        batch.batchId(), fingerprint, bucket, principal,
+                        versions.get(0).committedAt(), versions);
+
+                // 4) commit point: durable commit record
+                writeAtomic(batchesDir.resolve(encode(batch.batchId()) + ".json.tmp"),
+                        recordFile, toJson(record));
+                fsyncDir(batchesDir);
+
+                Runnable hook = batchCommitHook;
+                if (hook != null) {
+                    hook.run();
+                }
+
+                // 5) atomic visibility transition: flip all HEADs at once
+                visibilityLock.writeLock().lock();
+                try {
+                    for (VersionInfo info : versions) {
+                        Path objectDir = objectDir(bucket, info.key());
+                        writeAtomic(objectDir.resolve("HEAD.tmp"), objectDir.resolve("HEAD"),
+                                Long.toString(info.version()).getBytes(StandardCharsets.UTF_8));
+                        fsyncDir(objectDir);
+                    }
+                } finally {
+                    visibilityLock.writeLock().unlock();
+                }
+                return new BatchResult(batch.batchId(), versions, false);
+            } finally {
+                locks.forEach(ReentrantLock::unlock);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException("batch commit failed for id " + batch.batchId(), e);
+        } finally {
+            batchLock.unlock();
+        }
+    }
+
+    /** Structural validation: non-blank id, non-empty items, no duplicate keys. */
+    private static void validateBatchStructure(BatchCommit batch) {
+        if (batch.batchId() == null || batch.batchId().isBlank()) {
+            throw new StoreException(ErrorCode.INVALID_BATCH, "batch id must not be blank");
+        }
+        if (batch.items() == null || batch.items().isEmpty()) {
+            throw new StoreException(ErrorCode.INVALID_BATCH, "batch must contain at least one item");
+        }
+        Set<String> keys = new HashSet<>();
+        for (BatchItem item : batch.items()) {
+            if (!keys.add(item.key())) {
+                throw new StoreException(ErrorCode.INVALID_BATCH,
+                        "duplicate key '" + item.key() + "' in batch " + batch.batchId());
+            }
+        }
+    }
+
+    /** Canonical fingerprint of the batch content, to detect id reuse with different content. */
+    private static String fingerprint(BatchCommit batch) {
+        StringBuilder sb = new StringBuilder();
+        batch.items().stream().sorted(Comparator.comparing(BatchItem::key)).forEach(item -> {
+            WriteRequest r = item.request();
+            sb.append(item.key()).append(' ')
+                    .append(r.expectedVersion() == null ? "*" : r.expectedVersion()).append(' ')
+                    .append(sha256Hex(r.content() == null ? new byte[0] : r.content())).append('\n');
+        });
+        return sha256Hex(sb.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Validate all items, write new blobs (quota accounted, all-or-nothing under
+     * blobLock) and all version metadata files. Must be called holding the
+     * per-object locks of all items.
+     */
+    private List<VersionInfo> prepareBatch(String bucket, List<BatchItem> items, String principal)
+            throws IOException {
+        // 1) validate everything before writing a single byte
+        Map<String, byte[]> newContents = new LinkedHashMap<>();
+        for (BatchItem item : items) {
+            WriteRequest request = item.request();
+            byte[] content = request.content();
+            if (content == null || content.length == 0) {
+                throw new StoreException(ErrorCode.EMPTY_CONTENT, "empty content is not allowed");
+            }
+            String sha256 = sha256Hex(content);
+            if (request.checksumSha256() != null && !request.checksumSha256().equalsIgnoreCase(sha256)) {
+                throw new StoreException(ErrorCode.CHECKSUM_MISMATCH,
+                        "declared checksum " + request.checksumSha256() + " != actual " + sha256);
+            }
+            Path objectDir = objectDir(bucket, item.key());
+            long current = readHead(objectDir);
+            if (request.expectedVersion() != null && request.expectedVersion() != current) {
+                throw new StoreException(ErrorCode.VERSION_CONFLICT,
+                        "object " + bucket + "/" + item.key() + ": expected version "
+                                + request.expectedVersion() + " but current is " + current);
+            }
+            RetentionPolicy retention = readRetention(objectDir);
+            if (retention.complianceLock()) {
+                throw new StoreException(ErrorCode.COMPLIANCE_LOCKED,
+                        "object " + bucket + "/" + item.key() + " is compliance-locked");
+            }
+            if (retention.retentionUntil() != null && Instant.now().isBefore(retention.retentionUntil())) {
+                throw new StoreException(ErrorCode.RETENTION_ACTIVE,
+                        "object " + bucket + "/" + item.key()
+                                + " is retained until " + retention.retentionUntil());
+            }
+            newContents.putIfAbsent(sha256, content); // dedup within the batch
+        }
+
+        // 2) write net-new blobs atomically w.r.t. quota (all-or-nothing)
+        ensureBlobs(newContents);
+
+        // 3) version metadata files (still invisible: HEAD not yet flipped)
+        List<VersionInfo> versions = new ArrayList<>();
+        Instant now = Instant.now();
+        for (BatchItem item : items) {
+            Path objectDir = objectDir(bucket, item.key());
+            long next = readHead(objectDir) + 1;
+            byte[] content = item.request().content();
+            RetentionPolicy retention = readRetention(objectDir);
+            VersionInfo info = new VersionInfo(bucket, item.key(), next, sha256Hex(content),
+                    content.length, now, principal, retention.retentionUntil(), retention.complianceLock());
+            Path versionsDir = versionsDir(objectDir);
+            writeAtomic(versionsDir.resolve("v-" + next + ".json.tmp"),
+                    versionsDir.resolve("v-" + next + ".json"), toJson(info));
+            versions.add(info);
+        }
+        return versions;
+    }
+
+    /**
+     * Write all not-yet-present blobs under blobLock: quota is checked against
+     * the net-new bytes only, and the whole set is accounted atomically, so a
+     * quota rejection leaves no residual usage.
+     */
+    private void ensureBlobs(Map<String, byte[]> newContents) throws IOException {
+        synchronized (blobLock) {
+            Map<String, byte[]> toWrite = new LinkedHashMap<>();
+            long netNew = 0;
+            for (Map.Entry<String, byte[]> e : newContents.entrySet()) {
+                if (!Files.isRegularFile(blobsDir.resolve(e.getKey()))) {
+                    toWrite.put(e.getKey(), e.getValue());
+                    netNew += e.getValue().length;
+                }
+            }
+            if (usedBytes.get() + netNew > quotaBytes) {
+                throw new StoreException(ErrorCode.QUOTA_EXCEEDED,
+                        "quota exceeded: used=" + usedBytes.get() + " netNew=" + netNew
+                                + " quota=" + quotaBytes);
+            }
+            for (Map.Entry<String, byte[]> e : toWrite.entrySet()) {
+                writeAtomic(blobsDir.resolve(e.getKey() + ".tmp"),
+                        blobsDir.resolve(e.getKey()), e.getValue());
+            }
+            fsyncDir(blobsDir);
+            usedBytes.addAndGet(netNew);
+        }
+    }
+
+    private BatchCommitRecord readBatchRecord(Path recordFile) {
+        if (!Files.isRegularFile(recordFile)) {
+            return null;
+        }
+        try {
+            return JSON.readValue(recordFile.toFile(), BatchCommitRecord.class);
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to read batch record " + recordFile, e);
+        }
+    }
+
     // ------------------------------------------------------------------ get
 
     @Override
     public byte[] get(String bucket, String key, String principal) {
         accessControl.require(bucket, principal, Role.READER);
-        return get(bucket, key, latestCommittedVersion(bucket, key), principal);
+        visibilityLock.readLock().lock();
+        try {
+            return get(bucket, key, latestCommittedVersion(bucket, key), principal);
+        } finally {
+            visibilityLock.readLock().unlock();
+        }
     }
 
     @Override
     public byte[] get(String bucket, String key, long version, String principal) {
         accessControl.require(bucket, principal, Role.READER);
+        visibilityLock.readLock().lock();
+        try {
+            return doGet(bucket, key, version);
+        } finally {
+            visibilityLock.readLock().unlock();
+        }
+    }
+
+    private byte[] doGet(String bucket, String key, long version) {
         Path objectDir = objectDir(bucket, key);
         Path meta = versionsDir(objectDir).resolve("v-" + version + ".json");
         long head = readHead(objectDir);
@@ -204,6 +475,15 @@ public class LocalObjectStore implements ObjectStore {
     @Override
     public List<VersionInfo> listVersions(String bucket, String key, String principal) {
         accessControl.require(bucket, principal, Role.READER);
+        visibilityLock.readLock().lock();
+        try {
+            return doListVersions(bucket, key);
+        } finally {
+            visibilityLock.readLock().unlock();
+        }
+    }
+
+    private List<VersionInfo> doListVersions(String bucket, String key) {
         Path objectDir = objectDir(bucket, key);
         long head = readHead(objectDir);
         List<VersionInfo> result = new ArrayList<>();
@@ -224,7 +504,12 @@ public class LocalObjectStore implements ObjectStore {
     @Override
     public long headVersion(String bucket, String key, String principal) {
         accessControl.require(bucket, principal, Role.READER);
-        return latestCommittedVersion(bucket, key);
+        visibilityLock.readLock().lock();
+        try {
+            return latestCommittedVersion(bucket, key);
+        } finally {
+            visibilityLock.readLock().unlock();
+        }
     }
 
     // ------------------------------------------------------------- retention
@@ -314,20 +599,30 @@ public class LocalObjectStore implements ObjectStore {
 
     // ------------------------------------------------------------- recovery
 
-    /** Crash recovery: remove temp files and dangling versions beyond HEAD. */
+    /**
+     * Crash recovery, in order:
+     *   1) delete all *.tmp files (objects, blobs, batches);
+     *   2) replay durable batch commit records: flip any HEAD that the commit
+     *      point had already decided but the crash left behind;
+     *   3) delete dangling version files with version > HEAD (never committed).
+     */
     private void recoverUncommittedState() {
         if (!Files.isDirectory(bucketsDir)) {
             return;
         }
-        try (var bucketStream = Files.list(bucketsDir)) {
-            for (Path bucket : bucketStream.filter(Files::isDirectory).toList()) {
-                Path objectsDir = bucket.resolve("objects");
-                if (!Files.isDirectory(objectsDir)) {
-                    continue;
-                }
-                try (var objectStream = Files.list(objectsDir)) {
-                    for (Path objectDir : objectStream.filter(Files::isDirectory).toList()) {
-                        recoverObject(objectDir);
+        try {
+            deleteTempFiles();
+            replayCommittedBatches();
+            try (var bucketStream = Files.list(bucketsDir)) {
+                for (Path bucket : bucketStream.filter(Files::isDirectory).toList()) {
+                    Path objectsDir = bucket.resolve("objects");
+                    if (!Files.isDirectory(objectsDir)) {
+                        continue;
+                    }
+                    try (var objectStream = Files.list(objectsDir)) {
+                        for (Path objectDir : objectStream.filter(Files::isDirectory).toList()) {
+                            deleteDanglingVersions(objectDir);
+                        }
                     }
                 }
             }
@@ -336,10 +631,27 @@ public class LocalObjectStore implements ObjectStore {
         }
     }
 
-    private void recoverObject(Path objectDir) throws IOException {
-        long head = readHead(objectDir);
-        Path versionsDir = versionsDir(objectDir);
-        for (Path dir : new Path[]{objectDir, versionsDir, blobsDir}) {
+    private void deleteTempFiles() throws IOException {
+        List<Path> dirs = new ArrayList<>();
+        dirs.add(blobsDir);
+        dirs.add(batchesDir);
+        if (Files.isDirectory(bucketsDir)) {
+            try (var bucketStream = Files.list(bucketsDir)) {
+                for (Path bucket : bucketStream.filter(Files::isDirectory).toList()) {
+                    Path objectsDir = bucket.resolve("objects");
+                    if (!Files.isDirectory(objectsDir)) {
+                        continue;
+                    }
+                    try (var objectStream = Files.list(objectsDir)) {
+                        for (Path objectDir : objectStream.filter(Files::isDirectory).toList()) {
+                            dirs.add(objectDir);
+                            dirs.add(versionsDir(objectDir));
+                        }
+                    }
+                }
+            }
+        }
+        for (Path dir : dirs) {
             if (!Files.isDirectory(dir)) {
                 continue;
             }
@@ -349,12 +661,43 @@ public class LocalObjectStore implements ObjectStore {
                 }
             }
         }
-        if (Files.isDirectory(versionsDir)) {
-            try (var stream = Files.list(versionsDir)) {
-                for (Path meta : stream.filter(VersionInfoCodec::isVersionFile).toList()) {
-                    if (VersionInfoCodec.versionOf(meta) > head) {
-                        Files.delete(meta); // dangling, never committed
+    }
+
+    /**
+     * Replay every durable batch commit record: for each recorded version, if the
+     * object's HEAD is still behind, flip it forward. Idempotent — a HEAD already
+     * at or beyond the recorded version is left untouched.
+     */
+    private void replayCommittedBatches() throws IOException {
+        if (!Files.isDirectory(batchesDir)) {
+            return;
+        }
+        try (var stream = Files.list(batchesDir)) {
+            for (Path recordFile : stream.filter(p -> p.getFileName().toString().endsWith(".json"))
+                    .toList()) {
+                BatchCommitRecord record = readBatchRecord(recordFile);
+                for (VersionInfo info : record.versions()) {
+                    Path objectDir = objectDir(record.bucket(), info.key());
+                    if (readHead(objectDir) < info.version()) {
+                        writeAtomic(objectDir.resolve("HEAD.tmp"), objectDir.resolve("HEAD"),
+                                Long.toString(info.version()).getBytes(StandardCharsets.UTF_8));
+                        fsyncDir(objectDir);
                     }
+                }
+            }
+        }
+    }
+
+    private void deleteDanglingVersions(Path objectDir) throws IOException {
+        long head = readHead(objectDir);
+        Path versionsDir = versionsDir(objectDir);
+        if (!Files.isDirectory(versionsDir)) {
+            return;
+        }
+        try (var stream = Files.list(versionsDir)) {
+            for (Path meta : stream.filter(VersionInfoCodec::isVersionFile).toList()) {
+                if (VersionInfoCodec.versionOf(meta) > head) {
+                    Files.delete(meta); // dangling, never committed
                 }
             }
         }

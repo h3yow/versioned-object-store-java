@@ -18,6 +18,10 @@ public enum ErrorCode {
     VERSION_CONFLICT,
     /** 保留期内禁止删除/回收 */
     RETENTION_ACTIVE,
-    /** 合规锁定内禁止删除/回收 */
-    COMPLIANCE_LOCKED
+    /** 合规锁定内禁止删除/回收/覆盖 */
+    COMPLIANCE_LOCKED,
+    /** 批量提交结构非法（标识为空、条目为空、同一 key 重复出现） */
+    INVALID_BATCH,
+    /** 同一批量标识被内容不同的提交复用 */
+    BATCH_ID_REUSED
 }

@@ -23,9 +23,43 @@ root/
     versions/v-<n>.json                           不可变版本元数据
     HEAD                                          已签发版本号（提交点）
     retention.json                                保留策略
+  batches/<batchId>.json                          批量提交记录（整批的提交点与幂等存根）
 ```
 
 key 经百分号编码映射为安全路径段，任意 UTF-8 键均可使用且可逆。
+
+## 批量提交
+
+`commitBatch(bucket, BatchCommit, principal)` 把多个对象的新增/覆盖写入作为**一个整体**提交：
+要么全部可见，要么全部不可见。
+
+- **整体原子可见**：所有版本元数据落盘后，先原子写入提交记录
+  `batches/<batchId>.json`（整批的**提交点**），再在可见性写锁内一次性翻转所有对象的
+  `HEAD`。读者持读锁，任何一次读操作只会看到整批之前或整批之后的状态，
+  永远不会看到只提交了一部分对象的中间状态。
+- **与单对象写入兼容**：批内每个对象仍按单对象规则产生不可变版本，版本号从各自
+  HEAD 起单调递增、历史版本照旧可查；批量与单对象写入由对象级锁串行化，可安全混用。
+  `WriteRequest` 的语义（`expectedVersion` 乐观并发、校验和、非空内容）在批内逐项生效。
+- **容量与去重**：整批只按**净新增**内容计配额——批内相同内容只算一份，与已有内容块
+  相同的也不算。净新增超出剩余配额时整批拒绝（`QUOTA_EXCEEDED`），且配额检查与内容块
+  写入在同一临界区内完成，拒绝后不会残留已占用的空间。
+- **整批拒绝，原因可区分**：任一对象越权（`ACCESS_DENIED`）、`expectedVersion` 与当前
+  HEAD 冲突（`VERSION_CONFLICT`）、对象处于合规锁定（`COMPLIANCE_LOCKED`）或保留期内
+  （`RETENTION_ACTIVE`）、内容为空（`EMPTY_CONTENT`）、校验和不符
+  （`CHECKSUM_MISMATCH`）、批次结构非法（`INVALID_BATCH`：标识为空、条目为空、同一
+  key 重复）时，整批不落盘，其他对象也不受影响。所有校验在任何写入之前完成。
+- **保留规则说明**：批量提交对目标对象做写入前保留检查——合规锁定或保留期内的对象
+  不允许被覆盖产生新版本（单对象 `put` 行为保持不变，不做破坏性变更）。
+
+### 崩溃恢复与幂等重试
+
+- **崩溃一致性**：提交记录落盘前崩溃，整批不算数——重启恢复会清理悬空的版本元数据，
+  未引用的内容块由 `garbageCollect` 回收；提交记录落盘后崩溃，整批算成功——重启恢复
+  会根据提交记录把所有对象的 HEAD 补齐，整批完整可读。两种情形都不会留下半批数据。
+- **幂等重试**：客户端用同一 `batchId` 重试（如网络抖动后）时，已提交的批次直接回放
+  提交记录中的稳定结果（`BatchResult.idempotentReplay=true`），不重复产生版本、不重复
+  占用空间；重试结果与首次完全一致。同一 `batchId` 被**不同内容**复用时拒绝
+  （`BATCH_ID_REUSED`）。
 
 ## 并发与恢复语义
 
@@ -61,8 +95,10 @@ key 经百分号编码映射为安全路径段，任意 UTF-8 键均可使用且
 | `ACCESS_DENIED` | 越权访问 |
 | `OBJECT_NOT_FOUND` | 对象/版本/bucket 不存在 |
 | `VERSION_CONFLICT` | `expectedVersion` 与当前 HEAD 不一致 |
-| `RETENTION_ACTIVE` | 保留期内删除 |
-| `COMPLIANCE_LOCKED` | 合规锁定内删除 |
+| `RETENTION_ACTIVE` | 保留期内删除；批量提交覆盖保留期内对象 |
+| `COMPLIANCE_LOCKED` | 合规锁定内删除；批量提交覆盖合规锁定对象 |
+| `INVALID_BATCH` | 批量提交结构非法（标识为空、条目为空、key 重复） |
+| `BATCH_ID_REUSED` | 同一批量标识被不同内容的提交复用 |
 
 ## 本地验证方法
 
@@ -81,6 +117,10 @@ mvn test
   崩溃后重试的提交语义确定。
 - `AccessRetentionGcTest`：越权读/写/删除、对象不存在、保留期内删除被拒、
   保留期过期后删除成功、合规锁定删除被拒、内容块仅在无引用时回收。
+- `BatchCommitTest`：批量提交的原子性与提交中并发读取（读者只见整批前/后状态）、
+  批内去重与已有内容复用、配额超限整批拒绝且无残余占用、容量边界恰好可写、
+  权限/版本冲突/保留规则导致整批拒绝且原因可区分、提交点前/后崩溃的重启恢复、
+  同一标识重试幂等回放与标识复用拒绝。
 
 最小使用示例：
 
@@ -95,4 +135,12 @@ VersionInfo v1 = store.put("docs", "a.txt",
 byte[] data = store.get("docs", "a.txt", "alice");
 store.setRetention("docs", "a.txt",
         RetentionPolicy.until(Instant.now().plus(Duration.ofDays(7))), "bob");
+
+// 批量提交：单据与附属文件作为一个整体提交，可用同一 batchId 安全重试
+BatchResult result = store.commitBatch("docs", new BatchCommit("submit-42", List.of(
+        BatchItem.of("bill.json", billBytes),
+        BatchItem.of("attach-1.pdf", pdfBytes),
+        new BatchItem("attach-2.pdf",
+                new WriteRequest(pdf2Bytes, 3L, null))  // 乐观并发条件逐项生效
+)), "bob");
 ```

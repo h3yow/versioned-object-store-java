@@ -1,5 +1,7 @@
 package com.github.h3yow.versionedobjectstorejava.store;
 
+import com.github.h3yow.versionedobjectstorejava.store.model.BatchCommit;
+import com.github.h3yow.versionedobjectstorejava.store.model.BatchResult;
 import com.github.h3yow.versionedobjectstorejava.store.model.RetentionPolicy;
 import com.github.h3yow.versionedobjectstorejava.store.model.VersionInfo;
 import com.github.h3yow.versionedobjectstorejava.store.model.WriteRequest;
@@ -22,6 +24,17 @@ public interface ObjectStore {
      * 未携带 expectedVersion 时默认语义为无条件追加新版本。
      */
     VersionInfo put(String bucket, String key, WriteRequest request, String principal);
+
+    /**
+     * 批量提交：多个对象的新增/覆盖写入作为一个整体，要么全部可见要么全部不可见。
+     *
+     * <p>每个对象仍按单对象规则产生不可变版本，版本号照旧单调递增。整批只按净新增
+     * 内容计配额，超限则整批拒绝且不留残余占用；批内与跨批相同内容只存一份。
+     * 任一对象越权、版本条件冲突或违反保留规则时整批拒绝，原因以
+     * {@link StoreException#code()} 区分。以同一 batchId 重试时幂等：
+     * 不重复产生版本、不重复占用空间，返回稳定一致的结果。</p>
+     */
+    BatchResult commitBatch(String bucket, BatchCommit batch, String principal);
 
     /** 读取最新已提交版本的内容。 */
     byte[] get(String bucket, String key, String principal);
